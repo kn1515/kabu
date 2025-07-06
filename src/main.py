@@ -23,8 +23,16 @@ from collections import deque
 import json
 from datetime import datetime
 
+import os
+from dotenv import load_dotenv
+from random_walk import RandomWalkModel
+from visualizer import TradingVisualizer
+from trend_indicators import TrendSignalAnalyzer
+
+load_dotenv()
+
 RAKUTEN_API_BASE_URL = "http://localhost:18080/kabusapi"
-TOKEN = "<あなたのトークン>"
+TOKEN = os.getenv("RAKUTEN_API_TOKEN", "<あなたのトークン>")
 HEADERS = {
     "Content-Type": "application/json",
     "X-API-KEY": TOKEN
@@ -36,6 +44,18 @@ logging.basicConfig(filename='trading.log', level=logging.INFO)
 # 株価履歴
 price_history = deque(maxlen=100)
 
+# ランダムウォークモデル
+random_walk_model = RandomWalkModel(window_size=50)
+
+# 可視化
+visualizer = TradingVisualizer()
+
+# トレンド分析
+trend_analyzer = TrendSignalAnalyzer()
+
+# 取引履歴
+trade_history = []
+
 # 銘柄選択設定
 STOCK_SELECTION_CONFIG = {
     "min_volume": 1000000,      # 最小取引量
@@ -44,6 +64,8 @@ STOCK_SELECTION_CONFIG = {
     "min_price": 100,           # 最小価格
     "market_cap_min": 1000000000,  # 最小時価総額（10億円）
     "selection_interval": 3600,  # 銘柄選択間隔（秒）
+    "trend_signal_weight": 0.4,  # トレンドシグナルの重み
+    "min_trend_strength": 30,    # 最小トレンド強度
 }
 
 # 現在の対象銘柄
@@ -62,6 +84,58 @@ def get_price(symbol: str, exchange: int = 1):
     else:
         logging.error(f"株価取得失敗: {res.text}")
         return None
+
+# 株価履歴取得（トレンド分析用）
+def get_price_history(symbol: str, exchange: int = 1, days: int = 30):
+    """
+    指定銘柄の過去の株価履歴を取得
+    
+    Args:
+        symbol: 銘柄コード
+        exchange: 市場コード
+        days: 取得日数
+        
+    Returns:
+        価格履歴のリスト（日次終値）
+    """
+    try:
+        # 楽天証券APIの履歴データエンドポイント（例）
+        # 実際のAPIに応じて調整が必要
+        res = requests.get(
+            f"{RAKUTEN_API_BASE_URL}/primaryexchange",
+            headers=HEADERS,
+            params={
+                "symbol": symbol,
+                "exchange": exchange
+            }
+        )
+        
+        if res.status_code == 200:
+            # ここではサンプルデータを返す（実際の実装では過去データを取得）
+            # リアルタイムAPIからは直近のデータのみ取得可能な場合が多いため、
+            # 実際の運用では別途履歴データの蓄積が必要
+            
+            # 仮想的な価格履歴生成（実際の運用では削除）
+            current_price = get_price(symbol, exchange)
+            if current_price:
+                import random
+                random.seed(hash(symbol) % 1000)  # 銘柄ごとに一定のシード
+                history = []
+                price = current_price * 0.95  # 少し前の価格から開始
+                
+                for i in range(days):
+                    change = random.uniform(-0.03, 0.03)  # ±3%の変動
+                    price *= (1 + change)
+                    history.append(max(price, 1))  # 負の価格を防ぐ
+                
+                return history
+            
+        logging.error(f"株価履歴取得失敗: {symbol}")
+        return []
+        
+    except Exception as e:
+        logging.error(f"株価履歴取得エラー: {str(e)}")
+        return []
 
 # 取引量ランキング取得
 def get_volume_ranking():
@@ -114,33 +188,58 @@ def get_stock_info(symbol: str):
         logging.error(f"銘柄情報取得エラー: {str(e)}")
         return None
 
-# 銘柄スコア計算
+# 銘柄スコア計算（トレンド分析を含む）
 def calculate_stock_score(stock_data):
     score = 0
     try:
-        # 取引量スコア（30点満点）
+        symbol = stock_data.get("Symbol", "")
+        
+        # 基本的なスコア計算
+        # 取引量スコア（25点満点）
         volume = stock_data.get("Volume", 0)
         if volume > STOCK_SELECTION_CONFIG["min_volume"]:
-            volume_score = min(30, (volume / STOCK_SELECTION_CONFIG["min_volume"]) * 10)
+            volume_score = min(25, (volume / STOCK_SELECTION_CONFIG["min_volume"]) * 8)
             score += volume_score
         
-        # 値動きスコア（30点満点）
+        # 値動きスコア（25点満点）
         price_change_rate = abs(stock_data.get("ChangePreviousClose", 0))
         if price_change_rate > STOCK_SELECTION_CONFIG["min_price_change"]:
-            change_score = min(30, (price_change_rate / STOCK_SELECTION_CONFIG["min_price_change"]) * 15)
+            change_score = min(25, (price_change_rate / STOCK_SELECTION_CONFIG["min_price_change"]) * 12)
             score += change_score
         
-        # 価格レンジスコア（20点満点）
+        # 価格レンジスコア（15点満点）
         current_price = stock_data.get("CurrentPrice", 0)
         if STOCK_SELECTION_CONFIG["min_price"] <= current_price <= STOCK_SELECTION_CONFIG["max_price"]:
-            score += 20
+            score += 15
         
-        # 流動性スコア（20点満点）
+        # 流動性スコア（15点満点）
         bid_qty = stock_data.get("BidQty", 0)
         ask_qty = stock_data.get("AskQty", 0)
         if bid_qty > 0 and ask_qty > 0:
-            liquidity_score = min(20, (bid_qty + ask_qty) / 1000)
+            liquidity_score = min(15, (bid_qty + ask_qty) / 1000)
             score += liquidity_score
+        
+        # トレンド分析スコア（20点満点）
+        if symbol:
+            try:
+                price_history = get_price_history(symbol, days=30)
+                if len(price_history) >= 30:
+                    trend_result = trend_analyzer.get_comprehensive_signal(price_history)
+                    
+                    # 買いシグナルの場合はボーナス
+                    if trend_result['signal'] in ['buy', 'hold_buy']:
+                        trend_score = min(20, trend_result['strength'] / 100 * 20)
+                        score += trend_score * STOCK_SELECTION_CONFIG["trend_signal_weight"]
+                        
+                        logging.info(f"銘柄 {symbol} トレンドスコア: {trend_score:.1f} (シグナル: {trend_result['signal']}, 強度: {trend_result['strength']:.1f})")
+                    
+                    # 最小トレンド強度チェック
+                    if (trend_result['signal'] in ['buy', 'hold_buy'] and 
+                        trend_result['strength'] >= STOCK_SELECTION_CONFIG["min_trend_strength"]):
+                        score += 10  # 追加ボーナス
+                        
+            except Exception as trend_error:
+                logging.warning(f"銘柄 {symbol} のトレンド分析エラー: {str(trend_error)}")
         
         return score
     except Exception as e:
@@ -184,7 +283,7 @@ def auto_select_stock():
                 stock_data.update(detailed_info)
             
             score = calculate_stock_score(stock_data)
-            if score > 50:  # 閾値スコア
+            if score > 60:  # 閾値スコアを上げる（トレンド分析を考慮）
                 scored_stocks.append({
                     "symbol": symbol,
                     "score": score,
@@ -223,24 +322,44 @@ def should_select_new_stock():
     current_time = time.time()
     return (current_time - last_selection_time) >= STOCK_SELECTION_CONFIG["selection_interval"]
 
-# アルゴリズム売買ロジック（移動平均クロス）
+# アルゴリズム売買ロジック（移動平均クロス + ランダムウォーク）
 def decide_order(prices: list):
     if len(prices) < 25:
         return None
+    
+    # 従来の移動平均クロス
     short_ma = pd.Series(prices[-5:]).mean()
     long_ma = pd.Series(prices[-25:]).mean()
     logging.info(f"短期MA: {short_ma}, 長期MA: {long_ma}")
+    
+    # 移動平均による基本シグナル
+    ma_signal = None
     if short_ma > long_ma:
-        return "buy"
+        ma_signal = "buy"
     elif short_ma < long_ma:
-        return "sell"
+        ma_signal = "sell"
+    
+    # ランダムウォークモデルによるシグナル
+    rw_signal = random_walk_model.generate_trading_signal(
+        buy_threshold=0.55,  # 55%以上の確率で買い
+        sell_threshold=0.55  # 55%以上の確率で売り
+    )
+    
+    # 両方のシグナルが一致した場合のみ注文を出す
+    if ma_signal and rw_signal and ma_signal == rw_signal:
+        logging.info(f"シグナル一致: MA={ma_signal}, RW={rw_signal}")
+        return ma_signal
+    elif ma_signal and rw_signal:
+        logging.info(f"シグナル不一致: MA={ma_signal}, RW={rw_signal}")
+        return None
     else:
+        logging.info(f"シグナル不十分: MA={ma_signal}, RW={rw_signal}")
         return None
 
 # 注文発注
 def send_order(symbol: str, side: str, quantity: int):
     order_data = {
-        "Password": "<ログインパスワード>",
+        "Password": os.getenv("RAKUTEN_LOGIN_PASSWORD", "<ログインパスワード>"),
         "Symbol": symbol,
         "Exchange": 1,
         "SecurityType": 1,
@@ -260,8 +379,6 @@ def send_order(symbol: str, side: str, quantity: int):
 
 # メイン処理
 if __name__ == '__main__':
-    global current_symbol, last_selection_time
-    
     logging.info("株式自動売買システム開始")
     
     while True:
@@ -272,24 +389,39 @@ if __name__ == '__main__':
                 if new_symbol != current_symbol:
                     logging.info(f"銘柄切り替え: {current_symbol} -> {new_symbol}")
                     current_symbol = new_symbol
-                    # 新しい銘柄の場合は価格履歴をリセット
                     price_history.clear()
+                    # ランダムウォークモデルもリセット
+                    random_walk_model = RandomWalkModel(window_size=50)
                 last_selection_time = time.time()
             
             # 現在の銘柄の価格取得
             price = get_price(current_symbol)
-            if price:
-                price_history.append(price)
-                logging.info(f"現在価格 ({current_symbol}): {price}")
-                
-                # 売買判断
-                action = decide_order(list(price_history))
-                if action:
-                    success = send_order(current_symbol, action, 100)
-                    if success:
-                        logging.info(f"{action.upper()} 注文成功: {current_symbol} @ {price}")
-            else:
+            if not price:
                 logging.warning(f"価格取得失敗: {current_symbol}")
+                continue
+            
+            price_history.append(price)
+            # ランダムウォークモデルにも価格を追加
+            random_walk_model.add_price(price)
+            logging.info(f"現在価格 ({current_symbol}): {price}")
+            
+            # 売買判断
+            action = decide_order(list(price_history))
+            if not action:
+                continue
+            
+            success = send_order(current_symbol, action, 100)
+            if success:
+                logging.info(f"{action.upper()} 注文成功: {current_symbol} @ {price}")
+                trade_history.append((len(price_history)-1, action, price))
+                
+                # 100取引ごとに可視化を実行
+                if len(trade_history) % 100 == 0:
+                    try:
+                        visualizer.plot_random_walk_analysis(random_walk_model, forecast_steps=10)
+                        visualizer.plot_performance_metrics(list(price_history), trade_history)
+                    except Exception as viz_error:
+                        logging.error(f"可視化エラー: {str(viz_error)}")
                 
         except Exception as e:
             logging.error(f"メイン処理エラー: {str(e)}")

@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  kabu-trading:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kabu-trading-app
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - RAKUTEN_API_TOKEN=${RAKUTEN_API_TOKEN}
+      - RAKUTEN_LOGIN_PASSWORD=${RAKUTEN_LOGIN_PASSWORD}
+    volumes:
+      - ./logs:/app/logs
+      - ./trading.log:/app/trading.log
+    networks:
+      - kabu-network
+    depends_on:
+      - monitoring
+    labels:
+      - "com.docker.compose.project=kabu-trading"
+      - "com.docker.compose.service=trading-app"
+
+  monitoring:
+    image: prom/prometheus:latest
+    container_name: kabu-monitoring
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - kabu-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: kabu-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - kabu-network
+    depends_on:
+      - monitoring
+
+  # テスト用サービス
+  kabu-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: kabu-test
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PYTHONPATH=/app
+    volumes:
+      - ./src:/app/src
+      - ./test-results:/app/test-results
+    networks:
+      - kabu-network
+    profiles:
+      - test
+
+networks:
+  kabu-network:
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  grafana_data:
